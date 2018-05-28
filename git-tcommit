@@ -1,0 +1,188 @@
+#!/bin/bash
+# Copyright © Peter Baumann, 2016 - 2018
+
+# Wrapper script around git tfs rcheckin, which adds some useful functionality
+#
+# This script will prevent accidentally commiting work in progress stuff or
+# commits which are not yet ready to TFS.
+# Git Commits starting with (case insensitive) debug, wip, fixup are
+# considered not appropriate for putting them into TFS. The main reason for
+# this functionality is the specific workflow I use. I always have some 
+# internal debug commits (e.g. enhanced debug logging) or simply work in progress
+# commits which should never be put into TFS. 
+#
+# To avoid putting those into TFS, I rebase all commits so that my WIP/DEBUG commits 
+# are on top of the commits ment for TFS.
+# Calling this script via "git dcommit" after the rebase makes sure only commits
+# beneath the WIP commits are considered for TFS. 
+# Furthermore, a shortlog of commits which will be send to TFS is shown and the user has
+# to confirm before actually putting them into TFS.
+#
+# If this script is called via a specific commit (e.g. via its SHA1) as parameter,
+# then only commits beneath and including the commit itself are committet send to
+# upstream system.
+
+
+SUBDIRECTORY_OK=Yes
+
+. git-sh-setup
+require_work_tree
+require_clean_work_tree
+cd_to_toplevel || die "Can't find top level for the git repo"
+set_reflog_action git-tfs
+
+if [ "$1" = "--version" ]; then
+	echo "git tcommit - Version 1.0"
+	echo "Copyright (C) 2016, 2017 Peter Baumann"
+	exit 0
+fi
+
+# Newline character
+NL='
+'
+
+# Make sure tf.exe is in PATH
+export PATH="$PATH:/C/Program Files (x86)/Microsoft Visual Studio 12.0/Common7/IDE"
+tf workfold 2> /dev/null && die "${NL}ERROR: running 'git tfs fetch' in an existing workspace is not supported"
+
+# Stop at this commit
+last=
+if [ ! -z $1 ]; then
+	last=$(git rev-parse $1^{commit})
+	echo "$last"
+fi
+
+# The latest git commit we want to commit to the foreign configration system
+commit=
+
+# Remembers the original head
+orig_head=
+if branch=$(git symbolic-ref -q HEAD)
+then
+	orig_head=${branch#refs/heads/}
+else
+	orig_head='(detached head)'
+fi
+
+UPSTREAM=$(git rev-parse --symbolic-full-name @{u})
+if [ $? -ne 0 ]; then
+    die "Current branch does not have an upstream. Aborting."
+fi
+
+# Check that the upstream branch conforms to what we expect
+case "$UPSTREAM" in
+refs/remotes/tfs/*)
+	;;
+*)
+	die "Upstream branch looks like it isn't stored in TFS. Branch $UPSTREAM. Aborting!"
+	;;
+esac
+
+
+function get_last_upstream_commit()
+{
+	git log -1 --first-parent --grep 'git-tfs-id: \[https://' --pretty="%H"
+}
+
+# Print upstream branch name in red in case it is not 'trunk'
+function highlight_upstream_branch()
+{
+	COLOR_BRIGHT_RED="[1;31m"
+	NO_COLOR="[0m"
+	
+	local upstream_branch=${UPSTREAM}
+	if [ "$upstream_branch" != "trunk" ]; then
+		upstream_branch="${COLOR_BRIGHT_RED}${upstream_branch}${NO_COLOR}"
+	fi
+
+	echo "$upstream_branch"
+}
+
+function run()
+{
+	#echo "DEBUG: $@"
+	$@
+}	
+
+
+# Consistency check: Make sure that the commits which will be submitted don't
+# contain the relevant markes (git-tfs-id:) which indicate that they were already
+# submitted (e.g. they where cherry-picked from another branch)
+first_marker_commit=$(git log -1 --first-parent --grep 'git-tfs-id: \[https://' --pretty="%H" HEAD --not ${UPSTREAM})
+merge_base=$(git merge-base HEAD ${UPSTREAM})
+if [  "${first_marker_commit}x" != "x" ] && [ "${first_marker_commit}x" != "${merge_base}x" ]; then
+	echo "ERROR: Trying to submit commits which already where submitted."
+	echo ""
+	echo "Explanation: If those commits are e.g. cherry picked from a"
+	echo "different upstream branch, make sure to remove the upstream markers"
+	echo "from the commits."
+	exit 1
+fi
+
+
+# TODO: Alternative check, which might be faster on WINDOWS
+# Check if the commit subject matches (case insenstive) to one of the
+# following patterns. Leading whitespace is fine
+#	debug
+#	wip
+#	fixup
+#WIP_MARKERS='\(wip\|debug\|fixup\)'
+#first_wip_commit=$(git log --first-parent --reverse --pretty="%H %s" HEAD --not ${UPSTREAM}|\
+#	sed "s/^\(.\{40\}\)\s*${WIP_MARKERS}\s\s*.*$/\1/ip; d"|head -1)
+#
+#if [ -n "${first_wip_commit}" ]; then
+#	commit=$echo empty
+#else
+#
+#fi	
+
+	
+IFS='
+'
+for c in $(git log --first-parent --reverse --pretty="%H %s" HEAD --not "${UPSTREAM}"); do
+	# Split the log output into its fields
+	sha1="${c:0:40}"
+	msg="${c:41}"
+
+	# Check if the commit subject matches (case insenstive) to one of the
+	# following patterns. Leading whitespace is fine
+	# 	debug
+	#	wip
+	#	fixup
+	if echo "$msg"|egrep -i -q '^\s*(debug|wip|fixup)'; then
+		break
+	fi
+	commit=${sha1}
+
+	if [ "x${commit}" = "x${last}" ]; then
+		break
+	fi
+done
+
+if [ "x${commit}" = "x" ]; then
+	die "Nothing to commit - Perhaps you have only stuff not ready to submit?"
+fi
+
+echo ">>>> Submitting the following GIT commits <<<<"
+git --no-pager log --first-parent --pretty=oneline ${commit} --not "${UPSTREAM}"
+
+echo 
+echo "Submitting to TFS branch '$(highlight_upstream_branch)' (y/N)?"
+read yesno || die "Aborting"
+
+if [ "x${yesno}" == "xy" ] || [ "x$yesno" == "xY" ]; then
+	run git checkout -q "${commit}" || die "Checkout failed"
+	run git tfs rcheckin || {
+		echo "Here, we would normally rebase our changes, which is deactivated for now"
+		echo "Check: before tree: $(git rev-parse ${commit}^{tree})  $(git rev-parse ${UPSTREAM}^{tree}) tree after"
+		die "Aborting - git tfs rcheckin failed!"
+	}
+
+	if [ "${orig_head}" != "(detached head)" ]; then
+		echo "Rebasing your changes onto HEAD:"
+		run git rebase --onto HEAD HEAD ${orig_head}
+	else
+		echo "You have started this script being on a detached HEAD."
+		echo "Please rebase manually!"
+	fi
+fi

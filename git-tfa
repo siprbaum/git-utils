@@ -1,0 +1,29 @@
+#!/bin/bash
+# Copyright © Peter Baumann, 2016-2018
+#
+# Wrapper script around git tfs fetch --all, which adds some safety checks
+#
+# This script will prevent accidentally running 'git tfs fetch' in a TFS
+# workspace, because git tfs doesn't handles this case correctly and actually
+# kind of destroys the existing workspace.
+#
+
+SUBDIRECTORY_OK=Yes
+
+. git-sh-setup
+
+NL='
+'
+
+if [ "$1" = "--version" ]; then
+	echo "git tfa - Version 1.0"
+	echo "Copyright (C) 2016 - 2018 Peter Baumann"
+	exit 0
+fi
+
+# Make sure tf.exe is in PATH
+export PATH="$PATH:/C/Program Files (x86)/Microsoft Visual Studio 12.0/Common7/IDE"
+
+tf workfold 2> /dev/null && die "${NL}ERROR: running 'git tfs fetch' in an existing workspace is not supported"
+
+git tfs fetch --all

@@ -1,0 +1,138 @@
+#!/bin/bash
+# Copyright © Peter Baumann, 2011-2018
+
+# Wrapper script around git svn dcommit, which adds some useful functionality
+#
+# This script will prevent accidentally commiting some commits not yet ready
+# into SVN. Commits starting with (case insensitive) debug, wip, fixup are
+# considered not appropriate for putting them into SVN. The main reason for
+# this functionality is the specific workflow I use. I always have some 
+# internal debug commits (e.g. enhanced debug logging) or simply work in progress
+# commits which should never be put into SVN. 
+#
+# To avoid putting those into SVN, I rebase all commits so that my WIP/DEBUG commits 
+# are on top of the commits ment for SVN.
+# Calling this script via "git dcommit" after the rebase makes sure only commits
+# beneath the WIP commits are considered for SVN. 
+# Furthermore, a shortlog of commits ment for SVN is shown and the user has
+# to confirm before actually putting them into SVN.
+#
+# If this script is called via a specific commit (e.g. via its SHA1) as parameter,
+# then only commits beneath and including the commit itself are committet to SVN.
+
+
+SUBDIRECTORY_OK=Yes
+
+. git-sh-setup
+require_work_tree
+require_clean_work_tree
+cd_to_toplevel || die "foo"
+
+if [ "$1" = "--version" ]; then
+	echo "git dcommit - Version 1.1"
+	echo "Copyright (C) 2012 Peter Baumann"
+	exit 0
+fi
+
+# Stop at this commit
+last=
+if [ ! -z $1 ]; then
+	last=$(git rev-parse $1^{commit})
+	echo "$last"
+fi
+
+# The latest git commit we want to commit SVN
+commit=
+
+# Remembers the original head
+orig_head=
+if branch=$(git symbolic-ref -q HEAD)
+then
+	orig_head=${branch#refs/heads/}
+else
+	orig_head='(detached head)'
+fi
+
+function get_last_svn_upstream_commit()
+{
+	git log -1 --first-parent --grep git-svn --pretty="%H"
+}
+
+function get_upstream_svn_branch()
+{
+	git svn dcommit -n 2> /dev/null|head -1|sed -e 's#.*/platform/##'|sed -e 's# *\.\.\.$##'
+}
+
+# Print upstream branch name in red in case it is not 'trunk'
+function highlight_upstream_svn_branch()
+{
+	COLOR_BRIGHT_RED="[1;31m"
+	NO_COLOR="[0m"
+	
+	local upstream_branch=$(get_upstream_svn_branch)
+	if [ "$upstream_branch" != "trunk" ]; then
+		upstream_branch="${COLOR_BRIGHT_RED}${upstream_branch}${NO_COLOR}"
+	fi
+
+	echo "$upstream_branch"
+}
+
+function run()
+{
+	#echo "DEBUG: $@"
+	$@
+}	
+
+# Upstream ref
+upstream=$(get_last_svn_upstream_commit)
+
+
+IFS='
+'
+for c in $(git log --first-parent --reverse --pretty="%H %s" HEAD --not "${upstream}"); do
+	# Split the log output into its fields
+	sha1="${c:0:40}"
+	msg="${c:41}"
+
+	# Check if the commit subject matches (case insenstive) to one of the
+	# following patterns. Leading whitespace is fine
+	# 	debug
+	#	wip
+	#	fixup!
+	if echo "$msg"|egrep -i -q '^\s*(debug|wip|fixup)'; then
+		break
+	fi
+	commit=${sha1}
+
+	if [ "x${commit}" = "x${last}" ]; then
+		break
+	fi
+done
+
+if [ "x${commit}" == "x" ]; then
+	die "Nothing to commit - Perhaps you have only stuff not ready for SVN?"
+fi
+
+echo ">>>> Committing the folling GIT commits to SVN <<<<"
+git --no-pager log --first-parent --pretty=oneline ${commit} --not "${upstream}"
+echo
+
+# Show the latest commit we are going to submit to SVN
+#git show ${commit}
+
+echo
+echo "Commit to SVN branch '$(highlight_upstream_svn_branch)' (y/N)?"
+read yesno || die "Aborting"
+
+if [ "x${yesno}" == "xy" ] || [ "x$yesno" == "xY" ]; then
+	run git checkout -q "${commit}" || die "Checkout failed"
+	run git svn dcommit || die "Aborting - git svn dcommit failed!"
+
+	if [ "${orig_head}" != "(detached head)" ]; then
+		echo "Rebasing your changes onto HEAD:"
+		run git rebase --onto HEAD HEAD ${orig_head}
+	else
+		echo "You have started this script being on a detached HEAD."
+		echo "Please rebase manually!"
+	fi
+fi
